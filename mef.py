@@ -4,8 +4,8 @@ from enum import IntEnum
 
 import numpy as np
 
-from igi2cs.file_utils import Buffer, MemoryBuffer
-from igi2cs.res import ResChunk, ILFFHeader
+from igi2cs.file_utils import Buffer
+from igi2cs.loop_file import LoopFile
 
 
 class UnsupportedModelType(Exception):
@@ -66,7 +66,7 @@ class MeshInfo:
 
 
 @dataclass(slots=True)
-class MeshChunkData:
+class MeshHeader:
     version: float
     creation_type: DateTime
     model_type: ModelType
@@ -78,7 +78,7 @@ class MeshChunkData:
 
     field_74: float
     field_80: int
-    field_82: int
+    attachment_count: int
     field_84: int
     field_86: int
     glow_count: int
@@ -96,24 +96,24 @@ class MeshChunkData:
 
     @classmethod
     def from_buffer(cls, buffer: Buffer):
-        return MeshChunkData(buffer.read_float(), DateTime.from_buffer(buffer), ModelType(buffer.read_uint32()),
-                             buffer.read_fmt("3i"),
-                             (Sphere.from_buffer(buffer), Sphere.from_buffer(buffer), Sphere.from_buffer(buffer)),
-                             MeshInfo.from_buffer(buffer), MeshInfo.from_buffer(buffer),
-                             buffer.read_float(), buffer.read_uint16(), buffer.read_uint16(), buffer.read_uint16(),
-                             buffer.read_uint16(), buffer.read_uint16(), buffer.read_uint16(),
-                             buffer.read_uint32(), buffer.read_uint32(), buffer.read_uint32(),
-                             buffer.read_uint32(), buffer.read_uint32(), buffer.read_uint32(),
-                             buffer.read_uint32(), buffer.read_uint32(), buffer.read_uint32(),
-                             buffer.read_uint32()
-                             )
+        return MeshHeader(buffer.read_float(), DateTime.from_buffer(buffer), ModelType(buffer.read_uint32()),
+                          buffer.read_fmt("3i"),
+                          (Sphere.from_buffer(buffer), Sphere.from_buffer(buffer), Sphere.from_buffer(buffer)),
+                          MeshInfo.from_buffer(buffer), MeshInfo.from_buffer(buffer),
+                          buffer.read_float(), buffer.read_uint16(), buffer.read_uint16(), buffer.read_uint16(),
+                          buffer.read_uint16(), buffer.read_uint16(), buffer.read_uint16(),
+                          buffer.read_uint32(), buffer.read_uint32(), buffer.read_uint32(),
+                          buffer.read_uint32(), buffer.read_uint32(), buffer.read_uint32(),
+                          buffer.read_uint32(), buffer.read_uint32(), buffer.read_uint32(),
+                          buffer.read_uint32()
+                          )
 
 
 @dataclass(slots=True)
 class RenderStat:
     type: int
     dword0: int
-    lightmap_related: int
+    lightmap_count: int
     face_count: int
     face_group_count: int
     bone_related_0: int
@@ -151,91 +151,162 @@ class RenderStat:
 
 @dataclass(slots=True)
 class FaceGroup:
-    field0: int
+    color: tuple[int, int, int, int]
     scaled_vertex_sum: Vector3
     index_offset: int
     face_count: int
     vertex_offset: int
     vertex_count: int
-    group_id: int
+    indices: tuple[int, int]
 
     @classmethod
     def from_buffer(cls, buffer: Buffer):
-        return FaceGroup(buffer.read_uint32(), Vector3.from_buffer(buffer), buffer.read_uint16(), buffer.read_uint16(),
-                         buffer.read_uint16(), buffer.read_uint16(), buffer.read_uint32())
+        return FaceGroup(buffer.read_fmt("4B"), Vector3.from_buffer(buffer), buffer.read_uint16(), buffer.read_uint16(),
+                         buffer.read_uint16(), buffer.read_uint16(), buffer.read_fmt("2h"))
 
 
 @dataclass(slots=True)
 class Bone:
     name: str
     pos: Vector3
+    parent_id: int
+
+
+@dataclass(slots=True)
+class Attachment:
+    name: str
+    pos: Vector3
+    rotMat: list[float]
+    unk: int
+    bone_id: int
+
+    @classmethod
+    def from_buffer(cls, buffer: Buffer):
+        return Attachment(buffer.read_ascii_string(16), Vector3.from_buffer(buffer),
+                          buffer.read_fmt("9f"),
+                          buffer.read_uint32(), buffer.read_uint32())
 
 
 @dataclass(slots=True)
 class Mesh:
     render_info: RenderStat
-    faces: np.ndarray
-    vertices: np.ndarray
+    faces: np.ndarray = field(repr=False)
+    vertices: np.ndarray = field(repr=False)
     primitives: list[FaceGroup] = field(default_factory=list)
+
+
+@dataclass(slots=True)
+class CollisionMeshHeader:
+    face_count: int
+    vertex_count: int
+    material_count: int
+    sphere_count: int
+    field_10: int
+    field_14: int
+    field_18: int
+    field_1C: int
+    field_20: int
+    field_24: int
+    field_28: int
+    field_2C: int
+    field_30: int
+    field_34: int
+    field_38: int
+    field_3C: int
+
+    @classmethod
+    def from_buffer(cls, buffer: Buffer):
+        return CollisionMeshHeader(*buffer.read_fmt("16I"))
+
+
+@dataclass(slots=True)
+class CollisionSphere:
+    sphere: Sphere
+    unk: tuple[int, int, int, int]
+
+    @classmethod
+    def from_buffer(cls, buffer: Buffer):
+        return CollisionSphere(Sphere.from_buffer(buffer), buffer.read_fmt("4H"))
+
+
+CollisionSphereDtype = np.dtype([
+    ("pos", np.float32, (3,)),
+    ("radius", np.float32, (1,)),
+    ("unk", np.uint16, (4,)),
+])
+
+CollisionVertexDtype = np.dtype([
+    ("pos", np.float32, (3,)),
+    ("uv", np.float32, (2,))
+])
+CollisionFaceDtype = np.dtype([
+    ("face", np.uint16, (3,)),
+    ("unk", np.uint16, (3,))
+])
 
 
 class MefModel:
     def __init__(self, buffer: Buffer):
-        root_header = ILFFHeader.from_buffer(buffer)
-        if root_header.ident != "ILFF":
-            raise Exception("Invalid ILFF header")
-        container_type = buffer.read_ascii_string(4)
-        if container_type != "OCEM":
-            raise InvalidModelType("Invalid model type")
+        loop_file = LoopFile(buffer, flip_ident=True)
 
-        model_info: MeshChunkData | None = None
-        meshes: list[Mesh] = []
+        self.mesh_info: MeshHeader | None = None
+        self.collision_mesh_info: CollisionMeshHeader | None = None
+        self.mesh: Mesh | None = None
+        self.bones: list[Bone] = []
+        self.attachments: list[Attachment] = []
 
-        chunks: list[tuple[ILFFHeader, Buffer]] = []
-        while buffer:
-            chunk = ILFFHeader.from_buffer(buffer)
-            chunk_buffer = MemoryBuffer(buffer.read(chunk.data_size))
-            chunks.append((chunk, chunk_buffer))
-            buffer.align(chunk.alignment)
-        # for chunk in chunks:
-        #     print(chunk[0])
-        while chunks:
-            chunk, chunk_buffer = chunks.pop(0)
-            if chunk.ident == "HSEM":
-                model_info = MeshChunkData.from_buffer(chunk_buffer)
-            elif chunk.ident == "REIH":
-                parent_ids = []
-                child_count = [chunk_buffer.read_uint8() for _ in range(model_info.bone_count)]
-                positions = [Vector3.from_buffer(chunk_buffer) for _ in range(model_info.bone_count)]
-                print(child_count)
-            elif chunk.ident == "D3DR":
-                render_stat = RenderStat.from_buffer(chunk_buffer)
-                face_chunk, face_buffer = chunks.pop(0)
-                if face_chunk.ident != "ECAF":
-                    raise Exception("Expected 'ECAF' chunk")
-                faces = np.frombuffer(chunk_buffer.data, np.uint16)
+        while loop_file:
+            chunk = loop_file.next_chunk()
+            if chunk.ident == "MESH":
+                self.mesh_info = MeshHeader.from_buffer(chunk.buffer)
+            elif chunk.ident == "HIER":
+                child_counts = [chunk.buffer.read_uint8() for _ in range(self.mesh_info.bone_count)]
+                buffer.align(4)
+                bone_positions = [Vector3.from_buffer(chunk.buffer) for _ in range(self.mesh_info.bone_count)]
+                name_chunk = loop_file.expect_chunk("BNAM")
+                bone_names = [name_chunk.buffer.read_ascii_string(16) for _ in range(self.mesh_info.bone_count)]
+                bone_queue = []
 
-                rend_chunk, rend_buffer = chunks.pop(0)
-                if rend_chunk.ident != "DNER":
-                    raise Exception("Expected 'DNER' chunk")
-                render_info = [FaceGroup.from_buffer(rend_buffer) for _ in range(render_stat.face_group_count)]
+                def create_bone(parent_id: int, name: str, position: Vector3, child_count: int):
+                    bone = Bone(name, position, parent_id)
+                    next_parent_id = len(self.bones)
+                    self.bones.append(bone)
+                    counts = [child_counts.pop(0) for _ in range(child_count)]
+                    names = [bone_names.pop(0) for _ in range(child_count)]
+                    positions = [bone_positions.pop(0) for _ in range(child_count)]
+                    for count, name, position in zip(counts, names, positions):
+                        bone_queue.append((next_parent_id, name, position, count))
 
-                vert_chunk, vert_buffer = chunks.pop(0)
-                if vert_chunk.ident != "XTRV":
-                    raise Exception("Expected 'XTRV' chunk")
-                if model_info.model_type == ModelType.MODEL0:
+                bone_queue.append((-1, bone_names.pop(0), bone_positions.pop(0), child_counts.pop(0)))
+                while bone_queue:
+                    create_bone(*bone_queue.pop(0))
+            elif chunk.ident == "ATTA":
+                for _ in range(self.mesh_info.attachment_count):
+                    self.attachments.append(Attachment.from_buffer(chunk.buffer))
+            elif chunk.ident == "RD3D":
+                render_stat = RenderStat.from_buffer(chunk.buffer)
+                face_chunk = loop_file.expect_chunk("FACE")
+                faces = np.frombuffer(face_chunk.buffer.data, np.uint16)
+                del face_chunk
+
+                rend_chunk = loop_file.expect_chunk("REND")
+                render_info = [FaceGroup.from_buffer(rend_chunk.buffer) for _ in range(render_stat.face_group_count)]
+                del rend_chunk
+
+                vert_chunk = loop_file.expect_chunk("VRTX")
+                if self.mesh_info.model_type == ModelType.MODEL0:
                     dtype = np.dtype([
                         ("pos", np.float32, (3,)),
                         ("normal", np.float32, (3,)),
                         ("uv0", np.float32, (2,))
                     ])
-                elif model_info.model_type == ModelType.MODEL1:
+                elif self.mesh_info.model_type == ModelType.MODEL1:
                     dtype = np.dtype([
                         ("pos", np.float32, (3,)),
                         ("unk", np.float32, (6,)),
                         ("indices_and_weights", np.ushort, (2,))
                     ])
-                elif model_info.model_type == ModelType.MODEL3:
+                elif self.mesh_info.model_type == ModelType.MODEL3:
                     dtype = np.dtype([
                         ("pos", np.float32, (3,)),
                         ("uv0", np.float32, (2,)),
@@ -244,16 +315,29 @@ class MefModel:
                 else:
                     raise Exception("Unknown model type")
 
-                vertices = np.frombuffer(vert_buffer.data, dtype)
-                if render_stat.type == 44:
-                    face_chunk, face_buffer = chunks.pop(0)
-                    if face_chunk.ident != "PMTL":
-                        raise Exception("Expected 'PMTL' chunk")
+                vertices = np.frombuffer(vert_chunk.buffer.data, dtype)
+                del vert_chunk
+                # if render_stat.type == 44:
+                #     lightmap_chunk = loop_file.expect_chunk("LTMP")
                 mesh = Mesh(render_stat, faces, vertices, render_info)
-                meshes.append(mesh)
+                self.mesh = mesh
+            elif chunk.ident == "CMSH":
+                self.collision_mesh_info = CollisionMeshHeader.from_buffer(chunk.buffer)
+                collision_vertices_chunk = loop_file.expect_chunk("CVTX")
+                collision_faces_chunk = loop_file.expect_chunk("CFCE")
+                collision_materials_chunk = loop_file.expect_chunk("CMAT")
+                collision_spheres_chunk = loop_file.expect_chunk("CSPH")
+
+                collision_vertices = np.frombuffer(collision_vertices_chunk.buffer.data, CollisionVertexDtype)
+                collision_faces = np.frombuffer(collision_faces_chunk.buffer.data, CollisionFaceDtype)
+                collision_spheres = np.frombuffer(collision_spheres_chunk.buffer.data, CollisionSphereDtype)
+                del collision_vertices_chunk, collision_faces_chunk, collision_spheres_chunk
+
+                print(1)
             else:
-                pass
-                print(f"Unhandled chunk {chunk}")
-        print(model_info)
-        print(meshes)
+                if chunk.header.data_size > 0:
+                    print(f"Unhandled chunk {chunk}")
+        print(self.mesh_info)
+        print(self.mesh)
+        print(self.attachments)
         print("***************")

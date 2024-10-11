@@ -2,40 +2,30 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 
 from igi2cs.file_utils import Buffer, MemoryBuffer
-
-
-@dataclass(slots=True)
-class ILFFHeader:
-    ident: str
-    data_size: int
-    alignment: int
-    next_offset: int
-
-    @classmethod
-    def from_buffer(cls, buffer: Buffer):
-        return ILFFHeader(buffer.read_ascii_string(4), buffer.read_uint32(), buffer.read_uint32(), buffer.read_uint32())
+from igi2cs.loop_file import LoopFile
+from igi2cs.loop_header import FFLIHeader
 
 
 @dataclass(slots=True)
 class ResHeader:
-    header: ILFFHeader
+    header: FFLIHeader
     format: str
 
     @classmethod
     def from_buffer(cls, buffer: Buffer):
-        header = ILFFHeader.from_buffer(buffer)
+        header = FFLIHeader.from_buffer(buffer)
         fmt = buffer.read_ascii_string(4)
         return ResHeader(header, fmt)
 
 
 @dataclass(slots=True)
 class ResChunk:
-    header: ILFFHeader
+    header: FFLIHeader
     data: MemoryBuffer
 
     @classmethod
     def from_buffer(cls, buffer: Buffer):
-        header = ILFFHeader.from_buffer(buffer)
+        header = FFLIHeader.from_buffer(buffer)
         data = MemoryBuffer(buffer.read(header.data_size))
         buffer.align(header.alignment)
         return ResChunk(header, data)
@@ -44,32 +34,27 @@ class ResChunk:
 @dataclass(slots=True)
 class ResEntry:
     name: str
-    data: MemoryBuffer
+    data: Buffer
 
 
 class ResArchive:
     def __init__(self, buffer: Buffer):
-        self.header = ResHeader.from_buffer(buffer)
-        chunks = []
-        while buffer:
-            chunks.append(ResChunk.from_buffer(buffer))
-
+        loop_file = LoopFile(buffer, flip_ident=False)
+        if not loop_file.is_container_for("IRES"):
+            raise Exception("Not a RES loop file")
         all_names = []
         self.files = []
-        if chunks:
-            if chunks[-1].header.ident == "PATH":
-                name_chunk = chunks.pop(-2)
-                paths = chunks.pop(-1)
-                all_names.append(name_chunk.data.read_ascii_string())
-                all_names.extend(paths.data.read_ascii_string().split(";"))
-            while chunks:
-                name_chunk = chunks.pop(0)
-                assert name_chunk.header.ident == "NAME"
-                data_chunk = chunks.pop(0)
-                if data_chunk.header.ident == "BODY":
-                    self.files.append(ResEntry(name_chunk.data.read_ascii_string(), data_chunk.data))
-                elif data_chunk.header.ident == "CSTR":
-                    self.files.append(ResEntry(name_chunk.data.read_ascii_string(), data_chunk.data))
+        if loop_file:
+            while loop_file:
+                name_chunk = loop_file.expect_chunk("NAME")
+                data_chunk = loop_file.next_chunk()
+                if data_chunk.ident == "BODY":
+                    self.files.append(ResEntry(name_chunk.buffer.read_ascii_string(), data_chunk.buffer))
+                elif data_chunk.ident == "CSTR":
+                    self.files.append(ResEntry(name_chunk.buffer.read_ascii_string(), data_chunk.buffer))
+                elif data_chunk.ident == "PATH":
+                    all_names.append(name_chunk.buffer.read_ascii_string())
+                    all_names.extend(data_chunk.buffer.read_ascii_string().split(";"))
                 else:
                     assert False, f"Chunk of type {data_chunk.header.ident!r} not supported"
         if all_names:
@@ -78,7 +63,7 @@ class ResArchive:
     def __repr__(self):
         return f"ResArchive({len(self.files)} files)"
 
-    def __iter__(self)->Iterable[tuple[str,Buffer]]:
+    def __iter__(self) -> Iterable[tuple[str, Buffer]]:
         for entry in self.files:
             name = entry.name
             if name.startswith("LOCAL:"):

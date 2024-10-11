@@ -271,7 +271,7 @@ class MemoryBuffer(Buffer):
 
         return self._offset
 
-    def __str__(self) -> str:
+    def __repr__(self) -> str:
         return f'<MemoryBuffer {self.tell()}/{self.size()}>'
 
     def tell(self) -> int:
@@ -323,6 +323,8 @@ class FileBuffer(io.FileIO, Buffer):
         self._is_read_only = "r" in mode
 
     def size(self):
+        if self.closed:
+            return self._cached_size or -1
         if self._is_read_only:
             if self._cached_size is None:
                 self._cached_size = os.fstat(self.fileno()).st_size
