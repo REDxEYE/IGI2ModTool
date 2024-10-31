@@ -17,10 +17,10 @@ class InvalidModelType(Exception):
 
 
 class ModelType(IntEnum):
-    MODEL0 = 0
-    MODEL1 = 1
+    StaticModel = 0
+    SkinnedModel = 1
     MODEL2 = 2
-    MODEL3 = 3
+    LightmappedModel = 3
 
 
 class DateTime(datetime):
@@ -43,6 +43,8 @@ class Vector3:
     def from_buffer(cls, buffer: Buffer):
         return Vector3(buffer.read_float(), buffer.read_float(), buffer.read_float())
 
+    def to_list(self):
+        return [self.x, self.y, self.z]
 
 @dataclass(slots=True)
 class Sphere:
@@ -151,18 +153,27 @@ class RenderStat:
 
 @dataclass(slots=True)
 class FaceGroup:
-    color: tuple[int, int, int, int]
+    transparency: int
+    shininess: int
+    unk0: int
+    unk1: int
     scaled_vertex_sum: Vector3
     index_offset: int
     face_count: int
     vertex_offset: int
     vertex_count: int
-    indices: tuple[int, int]
+    diffuse_texture: int
+    bump_texture: int
+    reflection_texture: int
+    reflection_scale: int
+    bump_scale: int
 
     @classmethod
     def from_buffer(cls, buffer: Buffer):
-        return FaceGroup(buffer.read_fmt("4B"), Vector3.from_buffer(buffer), buffer.read_uint16(), buffer.read_uint16(),
-                         buffer.read_uint16(), buffer.read_uint16(), buffer.read_fmt("2h"))
+        return FaceGroup(buffer.read_uint8(), buffer.read_uint8(), buffer.read_uint8(), buffer.read_uint8(),
+                         Vector3.from_buffer(buffer), buffer.read_uint16(), buffer.read_uint16(),
+                         buffer.read_uint16(), buffer.read_uint16(), buffer.read_int16(), buffer.read_int16(),
+                         buffer.read_int16(), buffer.read_uint8(), buffer.read_uint8())
 
 
 @dataclass(slots=True)
@@ -201,40 +212,32 @@ class CollisionMeshHeader:
     vertex_count: int
     material_count: int
     sphere_count: int
-    field_10: int
-    field_14: int
-    field_18: int
-    field_1C: int
-    field_20: int
-    field_24: int
-    field_28: int
-    field_2C: int
-    field_30: int
-    field_34: int
-    field_38: int
-    field_3C: int
+    face_ptr: int
+    vertex_ptr: int
+    materials_ptr: int
+    sphere_ptr: int
+    face_2_count: int
+    vertex_2_count: int
+    material_2_count: int
+    sphere_2_count: int
+    face_2_ptr: int
+    vertex_2_ptr: int
+    materials_2_ptr: int
+    sphere_2_ptr: int
 
     @classmethod
     def from_buffer(cls, buffer: Buffer):
         return CollisionMeshHeader(*buffer.read_fmt("16I"))
 
 
-@dataclass(slots=True)
-class CollisionSphere:
-    sphere: Sphere
-    unk: tuple[int, int, int, int]
-
-    @classmethod
-    def from_buffer(cls, buffer: Buffer):
-        return CollisionSphere(Sphere.from_buffer(buffer), buffer.read_fmt("4H"))
-
-
 CollisionSphereDtype = np.dtype([
     ("pos", np.float32, (3,)),
     ("radius", np.float32, (1,)),
-    ("unk", np.uint16, (4,)),
+    ("id", np.int16, (1,)),
+    ("unk1", np.uint16, (1,)),
+    ("unk2", np.uint16, (1,)),
+    ("parent_id", np.int16, (1,)),
 ])
-
 CollisionVertexDtype = np.dtype([
     ("pos", np.float32, (3,)),
     ("uv", np.float32, (2,))
@@ -245,12 +248,20 @@ CollisionFaceDtype = np.dtype([
 ])
 
 
+@dataclass
+class CollisionData:
+    spheres: np.ndarray[CollisionSphereDtype]
+    faces: np.ndarray[CollisionFaceDtype]
+    vertices: np.ndarray[CollisionVertexDtype]
+
+
 class MefModel:
     def __init__(self, buffer: Buffer):
         loop_file = LoopFile(buffer, flip_ident=True)
 
         self.mesh_info: MeshHeader | None = None
         self.collision_mesh_info: CollisionMeshHeader | None = None
+        self.collision_data: CollisionData | None = None
         self.mesh: Mesh | None = None
         self.bones: list[Bone] = []
         self.attachments: list[Attachment] = []
@@ -261,7 +272,7 @@ class MefModel:
                 self.mesh_info = MeshHeader.from_buffer(chunk.buffer)
             elif chunk.ident == "HIER":
                 child_counts = [chunk.buffer.read_uint8() for _ in range(self.mesh_info.bone_count)]
-                buffer.align(4)
+                chunk.buffer.align(4)
                 bone_positions = [Vector3.from_buffer(chunk.buffer) for _ in range(self.mesh_info.bone_count)]
                 name_chunk = loop_file.expect_chunk("BNAM")
                 bone_names = [name_chunk.buffer.read_ascii_string(16) for _ in range(self.mesh_info.bone_count)]
@@ -294,19 +305,22 @@ class MefModel:
                 del rend_chunk
 
                 vert_chunk = loop_file.expect_chunk("VRTX")
-                if self.mesh_info.model_type == ModelType.MODEL0:
+                if self.mesh_info.model_type == ModelType.StaticModel:
                     dtype = np.dtype([
                         ("pos", np.float32, (3,)),
                         ("normal", np.float32, (3,)),
                         ("uv0", np.float32, (2,))
                     ])
-                elif self.mesh_info.model_type == ModelType.MODEL1:
+                elif self.mesh_info.model_type == ModelType.SkinnedModel:
                     dtype = np.dtype([
                         ("pos", np.float32, (3,)),
-                        ("unk", np.float32, (6,)),
-                        ("indices_and_weights", np.ushort, (2,))
+                        ("normal", np.float32, (3,)),
+                        ("uv0", np.float32, (2,)),
+                        ("weight", np.float32, (1,)),
+                        ("index", np.ushort, (1,)),
+                        ("bone_id", np.ushort, (1,))
                     ])
-                elif self.mesh_info.model_type == ModelType.MODEL3:
+                elif self.mesh_info.model_type == ModelType.LightmappedModel:
                     dtype = np.dtype([
                         ("pos", np.float32, (3,)),
                         ("uv0", np.float32, (2,)),
@@ -331,13 +345,15 @@ class MefModel:
                 collision_vertices = np.frombuffer(collision_vertices_chunk.buffer.data, CollisionVertexDtype)
                 collision_faces = np.frombuffer(collision_faces_chunk.buffer.data, CollisionFaceDtype)
                 collision_spheres = np.frombuffer(collision_spheres_chunk.buffer.data, CollisionSphereDtype)
+                self.collision_data = CollisionData(collision_spheres, collision_faces, collision_vertices)
                 del collision_vertices_chunk, collision_faces_chunk, collision_spheres_chunk
 
                 print(1)
             else:
                 if chunk.header.data_size > 0:
                     print(f"Unhandled chunk {chunk}")
-        print(self.mesh_info)
-        print(self.mesh)
-        print(self.attachments)
-        print("***************")
+        # print(self.mesh_info)
+        # print(self.mesh)
+        # print(self.collision_data)
+        # print(self.attachments)
+        # print("***************")
