@@ -317,6 +317,12 @@ class ShadowMeshData:
     edges: np.ndarray[np.uint32]
 
 
+MorphVertexDtype = np.dtype([
+    ("index", np.uint32, (1,)),
+    ("pos", np.float32, (3,)),
+])
+
+
 class MefModel:
     def __init__(self, buffer: Buffer):
         loop_file = LoopFile(buffer, flip_ident=True)
@@ -327,101 +333,25 @@ class MefModel:
         self.shadow_mesh_data: ShadowMeshData | None = None
         self.bones: list[Bone] = []
         self.attachments: list[Attachment] = []
+        self.morph_channels: dict[int, np.ndarray[MorphVertexDtype]] = {}
 
         while loop_file:
             chunk = loop_file.next_chunk()
             if chunk.ident == "MESH":
                 self.model_info = ModelInfo.from_buffer(chunk.buffer)
             elif chunk.ident == "HIER":
-                child_counts = [chunk.buffer.read_uint8() for _ in range(self.model_info.bone_count)]
-                chunk.buffer.align(4)
-                bone_positions = [Vector3.from_buffer(chunk.buffer) for _ in range(self.model_info.bone_count)]
-                name_chunk = loop_file.expect_chunk("BNAM")
-                bone_names = [name_chunk.buffer.read_ascii_string(16) for _ in range(self.model_info.bone_count)]
-                bone_queue = []
-
-                def create_bone(parent_id: int, name: str, position: Vector3, child_count: int):
-                    bone = Bone(name, position, parent_id)
-                    next_parent_id = len(self.bones)
-                    self.bones.append(bone)
-                    counts = [child_counts.pop(0) for _ in range(child_count)]
-                    names = [bone_names.pop(0) for _ in range(child_count)]
-                    positions = [bone_positions.pop(0) for _ in range(child_count)]
-                    for count, name, position in zip(counts, names, positions):
-                        bone_queue.append((next_parent_id, name, position, count))
-
-                bone_queue.append((-1, bone_names.pop(0), bone_positions.pop(0), child_counts.pop(0)))
-                while bone_queue:
-                    create_bone(*bone_queue.pop(0))
+                self.process_hierarchy(chunk, loop_file)
             elif chunk.ident == "ATTA":
                 for _ in range(self.model_info.attachment_count):
                     self.attachments.append(Attachment.from_buffer(chunk.buffer))
             elif chunk.ident == "RD3D":
-                assert self.render_mesh_data is None, "Mesh already exist! Report this!"
-                render_mesh_info = RenderMeshHeader.from_buffer(chunk.buffer)
-                face_chunk = loop_file.expect_chunk("FACE")
-                faces = np.frombuffer(face_chunk.buffer.data, np.uint16)
-
-                rend_chunk = loop_file.expect_chunk("REND")
-                render_info = [FaceGroup.from_buffer(rend_chunk.buffer, self.model_info.model_type) for _ in
-                               range(render_mesh_info.face_group_count)]
-
-                vert_chunk = loop_file.expect_chunk("VRTX")
-                if self.model_info.model_type == ModelType.StaticModel:
-                    dtype = np.dtype([
-                        ("pos", np.float32, (3,)),
-                        ("normal", np.float32, (3,)),
-                        ("uv0", np.float32, (2,))
-                    ])
-                elif self.model_info.model_type == ModelType.SkinnedModel:
-                    dtype = np.dtype([
-                        ("pos", np.float32, (3,)),
-                        ("normal", np.float32, (3,)),
-                        ("uv0", np.float32, (2,)),
-                        ("weight", np.float32, (1,)),
-                        ("index", np.ushort, (1,)),
-                        ("bone_id", np.ushort, (1,))
-                    ])
-                elif self.model_info.model_type == ModelType.LightmappedModel:
-                    dtype = np.dtype([
-                        ("pos", np.float32, (3,)),
-                        ("uv0", np.float32, (2,)),
-                        ("uv1", np.float32, (2,))
-                    ])
-                else:
-                    raise Exception("Unknown model type")
-
-                vertices = np.frombuffer(vert_chunk.buffer.data, dtype)
-                # if render_stat.type == 44:
-                #     lightmap_chunk = loop_file.expect_chunk("LTMP")
-                self.render_mesh_data = RenderMeshData(render_mesh_info, faces, vertices, render_info)
-                del vert_chunk, face_chunk, rend_chunk
+                self.process_render_mesh(chunk, loop_file)
             elif chunk.ident == "CMSH":
-                collision_mesh_info = CollisionMeshHeader.from_buffer(chunk.buffer)
-                collision_vertices_chunk = loop_file.expect_chunk("CVTX")
-                collision_faces_chunk = loop_file.expect_chunk("CFCE")
-                collision_materials_chunk = loop_file.expect_chunk("CMAT")
-                collision_spheres_chunk = loop_file.expect_chunk("CSPH")
-
-                collision_vertices = np.frombuffer(collision_vertices_chunk.buffer.data, CollisionVertexDtype)
-                collision_faces = np.frombuffer(collision_faces_chunk.buffer.data, CollisionFaceDtype)
-                collision_spheres = np.frombuffer(collision_spheres_chunk.buffer.data, CollisionSphereDtype)
-                self.collision_mesh_data = CollisionMeshData(collision_mesh_info, collision_spheres, collision_faces,
-                                                             collision_vertices)
-                del collision_vertices_chunk, collision_faces_chunk, collision_spheres_chunk
+                self.process_collision_mesh(chunk, loop_file)
             elif chunk.ident == "SMES":
-                shadow_mesh = ShadowMeshHeader.from_buffer(chunk.buffer)
-
-                vertex_chunk = loop_file.expect_chunk("SVTX")
-                face_chunk = loop_file.expect_chunk("SFAC")
-                edge_chunk = loop_file.expect_chunk("EDGE")
-
-                vertices = np.frombuffer(vertex_chunk.buffer.read(), np.float32).reshape(-1, 3)
-                faces = np.frombuffer(face_chunk.buffer.read(), ShadowFaceDtype)
-                edges = np.frombuffer(edge_chunk.buffer.read(), np.uint32).reshape(-1, 2)
-                self.shadow_mesh_data = ShadowMeshData(shadow_mesh, faces, vertices, edges)
-
-                del vertex_chunk, face_chunk, edge_chunk
+                self.process_shadow_mesh(chunk, loop_file)
+            elif chunk.ident == "MRPH":
+                self.process_morph(chunk)
             else:
                 if chunk.header.data_size > 0:
                     print(f"Unhandled chunk {chunk}")
@@ -430,3 +360,99 @@ class MefModel:
         # print(self.collision_data)
         # print(self.attachments)
         # print("***************")
+
+    def process_morph(self, chunk):
+        buffer = chunk.buffer
+        counts = []
+        for channel in range(16):
+            counts.append(buffer.read_uint32())
+        for channel, vertex_count in enumerate(counts):
+            vertices = np.frombuffer(buffer.read(MorphVertexDtype.itemsize * vertex_count), MorphVertexDtype)
+            self.morph_channels[channel] = vertices
+        del buffer, vertices, vertex_count, counts, channel
+
+    def process_shadow_mesh(self, chunk, loop_file):
+        shadow_mesh = ShadowMeshHeader.from_buffer(chunk.buffer)
+        vertex_chunk = loop_file.expect_chunk("SVTX")
+        face_chunk = loop_file.expect_chunk("SFAC")
+        edge_chunk = loop_file.expect_chunk("EDGE")
+        vertices = np.frombuffer(vertex_chunk.buffer.read(), np.float32).reshape(-1, 3)
+        faces = np.frombuffer(face_chunk.buffer.read(), ShadowFaceDtype)
+        edges = np.frombuffer(edge_chunk.buffer.read(), np.uint32).reshape(-1, 2)
+        self.shadow_mesh_data = ShadowMeshData(shadow_mesh, faces, vertices, edges)
+        del vertex_chunk, face_chunk, edge_chunk, vertices, faces, edges
+
+    def process_collision_mesh(self, chunk, loop_file):
+        collision_mesh_info = CollisionMeshHeader.from_buffer(chunk.buffer)
+        collision_vertices_chunk = loop_file.expect_chunk("CVTX")
+        collision_faces_chunk = loop_file.expect_chunk("CFCE")
+        collision_materials_chunk = loop_file.expect_chunk("CMAT")
+        collision_spheres_chunk = loop_file.expect_chunk("CSPH")
+        collision_vertices = np.frombuffer(collision_vertices_chunk.buffer.data, CollisionVertexDtype)
+        collision_faces = np.frombuffer(collision_faces_chunk.buffer.data, CollisionFaceDtype)
+        collision_spheres = np.frombuffer(collision_spheres_chunk.buffer.data, CollisionSphereDtype)
+        self.collision_mesh_data = CollisionMeshData(collision_mesh_info, collision_spheres, collision_faces,
+                                                     collision_vertices)
+        del (
+            collision_vertices_chunk, collision_faces_chunk, collision_spheres_chunk, collision_materials_chunk,
+            collision_vertices, collision_faces, collision_spheres, collision_mesh_info
+        )
+
+    def process_render_mesh(self, chunk, loop_file):
+        assert self.render_mesh_data is None, "Mesh already exist! Report this!"
+        render_mesh_info = RenderMeshHeader.from_buffer(chunk.buffer)
+        face_chunk = loop_file.expect_chunk("FACE")
+        faces = np.frombuffer(face_chunk.buffer.data, np.uint16).reshape(-1, 3)
+        rend_chunk = loop_file.expect_chunk("REND")
+        render_info = [FaceGroup.from_buffer(rend_chunk.buffer, self.model_info.model_type) for _ in
+                       range(render_mesh_info.face_group_count)]
+        vert_chunk = loop_file.expect_chunk("VRTX")
+        if self.model_info.model_type == ModelType.StaticModel:
+            dtype = np.dtype([
+                ("pos", np.float32, (3,)),
+                ("normal", np.float32, (3,)),
+                ("uv0", np.float32, (2,))
+            ])
+        elif self.model_info.model_type == ModelType.SkinnedModel:
+            dtype = np.dtype([
+                ("pos", np.float32, (3,)),
+                ("normal", np.float32, (3,)),
+                ("uv0", np.float32, (2,)),
+                ("weight", np.float32, (1,)),
+                ("index", np.ushort, (1,)),
+                ("bone_id", np.ushort, (1,))
+            ])
+        elif self.model_info.model_type == ModelType.LightmappedModel:
+            dtype = np.dtype([
+                ("pos", np.float32, (3,)),
+                ("uv0", np.float32, (2,)),
+                ("uv1", np.float32, (2,))
+            ])
+        else:
+            raise Exception("Unknown model type")
+        vertices = np.frombuffer(vert_chunk.buffer.data, dtype)
+        # if render_stat.type == 44:
+        #     lightmap_chunk = loop_file.expect_chunk("LTMP")
+        self.render_mesh_data = RenderMeshData(render_mesh_info, faces, vertices, render_info)
+
+    def process_hierarchy(self, chunk, loop_file):
+        child_counts = [chunk.buffer.read_uint8() for _ in range(self.model_info.bone_count)]
+        chunk.buffer.align(4)
+        bone_positions = [Vector3.from_buffer(chunk.buffer) for _ in range(self.model_info.bone_count)]
+        name_chunk = loop_file.expect_chunk("BNAM")
+        bone_names = [name_chunk.buffer.read_ascii_string(16) for _ in range(self.model_info.bone_count)]
+        bone_queue = []
+
+        def create_bone(parent_id: int, name: str, position: Vector3, child_count: int):
+            bone = Bone(name, position, parent_id)
+            next_parent_id = len(self.bones)
+            self.bones.append(bone)
+            counts = [child_counts.pop(0) for _ in range(child_count)]
+            names = [bone_names.pop(0) for _ in range(child_count)]
+            positions = [bone_positions.pop(0) for _ in range(child_count)]
+            for count, name, position in zip(counts, names, positions):
+                bone_queue.append((next_parent_id, name, position, count))
+
+        bone_queue.append((-1, bone_names.pop(0), bone_positions.pop(0), child_counts.pop(0)))
+        while bone_queue:
+            create_bone(*bone_queue.pop(0))

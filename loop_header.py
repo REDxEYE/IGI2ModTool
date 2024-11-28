@@ -12,8 +12,7 @@ class FFLIHeader:
 
     @classmethod
     def from_buffer(cls, buffer: Buffer, flip_ident: bool = False):
-        ident = buffer.read_ascii_string(4)
+        ident = buffer.read(4)
         if flip_ident:
             ident = ident[::-1]
-        return FFLIHeader(ident, buffer.read_uint32(), buffer.read_uint32(),
-                          buffer.read_uint32())
+        return FFLIHeader(ident.decode("ascii"), *buffer.read_fmt("3I"))
