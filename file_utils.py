@@ -13,6 +13,13 @@ from typing import Optional, Protocol, Union, TypeVar, Type
 
 T = TypeVar("T")
 
+class Readable(Protocol):
+    @classmethod
+    def from_buffer(cls: Type[T], buffer: 'Buffer') -> T:
+        ...
+
+TR = TypeVar("TR", bound=Readable)
+
 
 class Buffer(abc.ABC, io.RawIOBase):
     def __init__(self):
@@ -367,12 +374,5 @@ class MemorySlice(MemoryBuffer):
         return self.tell() + self._slice_offset
 
 
-class Readable(Protocol):
-    @classmethod
-    def from_buffer(cls: Type[T], buffer: Buffer) -> T:
-        ...
-
-
-TR = TypeVar("TR", bound=Readable)
 
 __all__ = ['Buffer', 'MemoryBuffer', 'WritableMemoryBuffer', 'FileBuffer', 'Readable']

@@ -100,3 +100,14 @@ class MTPFile:
                         self.texture_infos.append(MTPIndex.from_buffer(chunk_data))
                 else:
                     print(f"Unhandled MTP chunk {chunk}")
+
+    def get_texture_names(self, model_name: str):
+        model_index = self.models.index(model_name)
+        instance = next(filter(lambda x: x.model_id == model_index, self.instances), None)
+        if instance is None:
+            return []
+        texture_names = []
+        for texture_info_id in instance.texture_info_ids:
+            texture_info = self.texture_infos[texture_info_id]
+            texture_names.append(self.textures[texture_info.index])
+        return texture_names

@@ -156,7 +156,7 @@ class RenderMeshHeader:
 
 
 @dataclass(slots=True)
-class CollisionMeshHeader:
+class CollisionMeshSubHeader:
     face_count: int
     vertex_count: int
     material_count: int
@@ -165,18 +165,19 @@ class CollisionMeshHeader:
     vertex_ptr: int
     materials_ptr: int
     sphere_ptr: int
-    face_2_count: int
-    vertex_2_count: int
-    material_2_count: int
-    sphere_2_count: int
-    face_2_ptr: int
-    vertex_2_ptr: int
-    materials_2_ptr: int
-    sphere_2_ptr: int
+
+
+@dataclass(slots=True)
+class CollisionMeshHeader:
+    mesh0: CollisionMeshSubHeader
+    mesh1: CollisionMeshSubHeader
 
     @classmethod
     def from_buffer(cls, buffer: Buffer):
-        return CollisionMeshHeader(*buffer.read_fmt("16I"))
+        return CollisionMeshHeader(
+            CollisionMeshSubHeader(*buffer.read_fmt("8I")),
+            CollisionMeshSubHeader(*buffer.read_fmt("8I"))
+        )
 
 
 @dataclass(slots=True)
@@ -280,8 +281,8 @@ CollisionSphereDtype = np.dtype([
     ("pos", np.float32, (3,)),
     ("radius", np.float32, (1,)),
     ("id", np.int16, (1,)),
-    ("unk1", np.uint16, (1,)),
-    ("unk2", np.uint16, (1,)),
+    ("count", np.uint16, (1,)),
+    ("child_id", np.uint16, (1,)),
     ("parent_id", np.int16, (1,)),
 ])
 CollisionVertexDtype = np.dtype([
@@ -290,7 +291,8 @@ CollisionVertexDtype = np.dtype([
 ])
 CollisionFaceDtype = np.dtype([
     ("face", np.uint16, (3,)),
-    ("unk", np.uint16, (3,))
+    ("mat_id", np.uint16, (1,)),
+    ("unk", np.uint16, (2,))
 ])
 
 
@@ -330,6 +332,7 @@ class MefModel:
         self.model_info: ModelInfo | None = None
         self.render_mesh_data: RenderMeshData | None = None
         self.collision_mesh_data: CollisionMeshData | None = None
+        self.collision_mesh_data2: CollisionMeshData | None = None
         self.shadow_mesh_data: ShadowMeshData | None = None
         self.bones: list[Bone] = []
         self.attachments: list[Attachment] = []
@@ -393,6 +396,17 @@ class MefModel:
         collision_spheres = np.frombuffer(collision_spheres_chunk.buffer.data, CollisionSphereDtype)
         self.collision_mesh_data = CollisionMeshData(collision_mesh_info, collision_spheres, collision_faces,
                                                      collision_vertices)
+        if collision_mesh_info.mesh1.face_count > 0:
+            collision_vertices_chunk = loop_file.expect_chunk("CVTX")
+            collision_faces_chunk = loop_file.expect_chunk("CFCE")
+            collision_materials_chunk = loop_file.expect_chunk("CMAT")
+            collision_spheres_chunk = loop_file.expect_chunk("CSPH")
+            collision_vertices = np.frombuffer(collision_vertices_chunk.buffer.data, CollisionVertexDtype)
+            collision_faces = np.frombuffer(collision_faces_chunk.buffer.data, CollisionFaceDtype)
+            collision_spheres = np.frombuffer(collision_spheres_chunk.buffer.data, CollisionSphereDtype)
+            self.collision_mesh_data2 = CollisionMeshData(collision_mesh_info, collision_spheres, collision_faces,
+                                                          collision_vertices)
+
         del (
             collision_vertices_chunk, collision_faces_chunk, collision_spheres_chunk, collision_materials_chunk,
             collision_vertices, collision_faces, collision_spheres, collision_mesh_info
@@ -436,7 +450,7 @@ class MefModel:
         self.render_mesh_data = RenderMeshData(render_mesh_info, faces, vertices, render_info)
 
     def process_hierarchy(self, chunk, loop_file):
-        child_counts = [chunk.buffer.read_uint8() for _ in range(self.model_info.bone_count)]
+        inside_of_counts = [chunk.buffer.read_uint8() for _ in range(self.model_info.bone_count)]
         chunk.buffer.align(4)
         bone_positions = [Vector3.from_buffer(chunk.buffer) for _ in range(self.model_info.bone_count)]
         name_chunk = loop_file.expect_chunk("BNAM")
